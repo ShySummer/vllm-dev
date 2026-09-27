@@ -461,13 +461,7 @@ class Scheduler(SchedulerInterface):
     def _schedule_layered_prefill(
         self, throttle_prefills: bool = False
     ) -> SchedulerOutput:
-        """Run the Phase 1 one-cohort policy around the regular scheduler.
-
-        The regular scheduler remains the source of truth for Decode admission,
-        preemption and all connector-free bookkeeping.  We reserve one prompt
-        cohort's token budget, let the regular path schedule Decode rows, then
-        append the layer-group query rows with an explicit commit mask.
-        """
+        """Schedule Decode first, then one fixed-budget layer group."""
         candidate = self._get_layered_prefill_candidate()
         if candidate is None:
             return self._schedule_regular(throttle_prefills)
@@ -512,21 +506,40 @@ class Scheduler(SchedulerInterface):
             RequestStatus.PREEMPTED,
         )
         request_is_new = admission_status == RequestStatus.WAITING
-
-        # A running request already owns its prompt blocks.  A newly admitted
-        # request is removed from the waiting queue and reserves them exactly
-        # once; every later group reuses the reservation.  Admission runs
-        # before the token budget is carved: a failed reservation must fall
-        # back to regular scheduling with the full budget, or the doomed
-        # candidate's query budget would starve the running Decode rows and
-        # wedge the engine in zero-token steps.
         if request_needs_admission:
-            # Keep the candidate out of the regular waiting traversal while it
-            # admits Decode requests.  It is requeued if the reservation fails.
             self._remove_layered_candidate_from_waiting(candidate)
+
+        self._hold_layered_prefills = True
+        try:
+            scheduler_output = self._schedule_regular(throttle_prefills)
+        finally:
+            self._hold_layered_prefills = False
+
+        if not candidate.layered_prefill_enabled or (
+            candidate.status not in (
+                RequestStatus.WAITING,
+                RequestStatus.PREEMPTED,
+                RequestStatus.RUNNING,
+            )
+        ):
+            if request_needs_admission:
+                self._requeue_layered_candidate(candidate, admission_status)
+            return scheduler_output
+
+        remaining_tokens = (
+            self.max_num_scheduled_tokens
+            - scheduler_output.total_num_scheduled_tokens
+        )
+        if query_tokens > remaining_tokens:
+            if request_needs_admission:
+                self._requeue_layered_candidate(candidate, admission_status)
+            return scheduler_output
+
+        # Admit P after Decode.  Later groups reuse the prompt reservation.
+        if request_needs_admission:
             if len(self.running) >= self.max_num_running_reqs:
                 self._requeue_layered_candidate(candidate, admission_status)
-                return self._schedule_regular(throttle_prefills)
+                return scheduler_output
             # Prefix-cache lookup mirrors the regular waiting path.  Cached
             # blocks are complete for every layer once the producing request
             # finished its cohort, so layered requests may reuse them.
@@ -551,7 +564,7 @@ class Scheduler(SchedulerInterface):
                 if candidate.layered_prefill_group_id == 0:
                     reset_layered_prefill_request(candidate)
                 self._requeue_layered_candidate(candidate, admission_status)
-                return self._schedule_regular(throttle_prefills)
+                return scheduler_output
             if num_computed_tokens != candidate.num_computed_tokens:
                 candidate.num_computed_tokens = num_computed_tokens
                 # Re-plan the first chunk from the cache-hit position so
@@ -570,23 +583,6 @@ class Scheduler(SchedulerInterface):
             raise RuntimeError(
                 f"Layered request {candidate.request_id} has no KV reservation"
             )
-
-        old_max_tokens = self.max_num_scheduled_tokens
-        self.max_num_scheduled_tokens = old_max_tokens - query_tokens
-        self._hold_layered_prefills = True
-        try:
-            scheduler_output = self._schedule_regular(throttle_prefills)
-        finally:
-            self._hold_layered_prefills = False
-            self.max_num_scheduled_tokens = old_max_tokens
-
-        if not candidate.layered_prefill_enabled or (
-            candidate.status != RequestStatus.RUNNING
-        ):
-            # The regular admission path may have preempted this request to
-            # make room for a higher-priority Decode request.  Its preemption
-            # handler already reset the frontier metadata and requeued it.
-            return scheduler_output
 
         if request_needs_admission:
             layered_zero_ids = self._get_new_block_ids_to_zero()
@@ -744,12 +740,7 @@ class Scheduler(SchedulerInterface):
         """Whether regular scheduling must leave a prompt for the policy."""
         return bool(
             self._hold_layered_prefills
-            and request.status
-            in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
-            and request.pooling_params is None
-            and request.num_prompt_tokens > 0
-            and request.num_computed_tokens == 0
-            and not request.output_token_ids
+            and not self._is_layered_decode_request(request)
         )
 
     def _has_layered_decode_work(self, candidate: Request) -> bool:
@@ -944,6 +935,13 @@ class Scheduler(SchedulerInterface):
                 # reservation before handing it back to regular scheduling.
                 self.running.pop(req_index)
                 self._preempt_request(request, time.monotonic())
+                continue
+
+            if (
+                self._hold_layered_prefills
+                and not self._is_layered_decode_request(request)
+            ):
+                req_index += 1
                 continue
 
             if (

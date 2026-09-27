@@ -399,6 +399,21 @@ class LayeredPrefillPolicy:
         self.max_num_batched_tokens = int(
             getattr(scheduler_config, "max_num_batched_tokens", 0) or 0
         )
+        if scheduler_config is not None and self.config.enabled:
+            token_budget = min(
+                self.max_num_batched_tokens,
+                getattr(scheduler_config, "max_num_scheduled_tokens", None)
+                or self.max_num_batched_tokens,
+            )
+            decode_reserve = int(scheduler_config.max_num_seqs) * (
+                1 + int(getattr(vllm_config, "num_speculative_tokens", 0) or 0)
+            )
+            self.max_num_batched_tokens = token_budget - decode_reserve
+            if self.max_num_batched_tokens <= 0:
+                raise ValueError(
+                    "Layered prefill requires token budget greater than "
+                    "max_num_seqs * (1 + num_speculative_tokens)"
+                )
         self._next_cohort_id = 0
 
     @property

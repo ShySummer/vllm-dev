@@ -24,6 +24,8 @@ from vllm.v1.core.sched.scheduler import (
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 def _config(
     *,
@@ -269,6 +271,43 @@ def test_config_rejects_multiple_groups_per_step_in_phase_one():
         LayeredPrefillConfig(enabled=True, max_groups_per_step=2)
 
 
+@pytest.mark.parametrize(
+    "num_speculative_tokens, expected_prefill_budget",
+    [(0, 96), (2, 88)],
+)
+def test_policy_reserves_worst_case_decode_tokens(
+    num_speculative_tokens: int, expected_prefill_budget: int
+):
+    config = _config()
+    config.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=100,
+        max_num_scheduled_tokens=None,
+        max_num_seqs=4,
+    )
+    config.num_speculative_tokens = num_speculative_tokens
+    policy = LayeredPrefillPolicy(config)
+    request = SimpleNamespace(num_prompt_tokens=100)
+
+    policy.plan_chunk(request, 0)
+
+    assert request.layered_prefill_query_tokens == expected_prefill_budget
+    policy.plan_chunk(request, expected_prefill_budget)
+    assert request.layered_prefill_query_tokens == 100 - expected_prefill_budget
+
+
+def test_policy_rejects_budget_without_prefill_room():
+    config = _config()
+    config.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=4,
+        max_num_scheduled_tokens=None,
+        max_num_seqs=4,
+    )
+    config.num_speculative_tokens = 0
+
+    with pytest.raises(ValueError, match="Layered prefill requires token budget"):
+        LayeredPrefillPolicy(config)
+
+
 _LAYERED_ASYNC_ADDITIONAL_CONFIG = {
     "scheduler_config": {
         "layered_prefill_config": {
@@ -428,6 +467,63 @@ def test_async_scheduler_layered_prefill_gate_falls_back_for_pp2():
     sched_output = scheduler.schedule()
     assert sched_output.layered_prefill_plan is None
     assert not request.layered_prefill_enabled
+
+
+@pytest.mark.cpu_test
+def test_decode_gets_kv_first_and_prefill_chunk_keeps_fixed_budget():
+    scheduler = create_scheduler(
+        max_num_seqs=3,
+        max_num_batched_tokens=1024,
+        max_model_len=2048,
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+    )
+    first, second = create_requests(
+        num_requests=2, num_tokens=32, max_tokens=10, ignore_eos=True
+    )
+    scheduler.add_request(first)
+    _run_async_step(scheduler, scheduler.schedule())
+    scheduler.add_request(second)
+    _run_async_step(scheduler, scheduler.schedule())
+
+    (prefill,) = create_requests(
+        num_requests=1, num_tokens=1023, max_tokens=2, ignore_eos=True
+    )
+    prefill.request_id = "prefill-third"
+    scheduler.add_request(prefill)
+    allocations = []
+    allocate_slots = scheduler.kv_cache_manager.allocate_slots
+
+    def record_allocations(request, num_new_tokens, *args, **kwargs):
+        allocations.append((request.request_id, num_new_tokens))
+        return allocate_slots(request, num_new_tokens, *args, **kwargs)
+
+    scheduler.kv_cache_manager.allocate_slots = record_allocations
+    try:
+        output = scheduler.schedule()
+    finally:
+        scheduler.kv_cache_manager.allocate_slots = allocate_slots
+
+    plan = output.layered_prefill_plan
+    assert plan is not None and plan.group_id == 0
+    assert plan.query_tokens[prefill.request_id] == 1021
+    assert list(output.num_scheduled_tokens)[-1] == prefill.request_id
+    assert output.num_scheduled_tokens[first.request_id] == 1
+    assert output.num_scheduled_tokens[second.request_id] == 1
+    assert output.total_num_scheduled_tokens == 1023
+    assert allocations[-1][0] == prefill.request_id
+    assert all(req_id != prefill.request_id for req_id, _ in allocations[:-1])
+    _run_async_step(scheduler, output)
+
+    second.next_decode_eligible_step = scheduler.current_step + 10
+    output = scheduler.schedule()
+    plan = output.layered_prefill_plan
+    assert plan is not None and plan.group_id == 1
+    assert plan.query_tokens[prefill.request_id] == 1021
+    assert output.num_scheduled_tokens[first.request_id] == 1
+    assert output.total_num_scheduled_tokens == 1022
 
 
 @pytest.mark.cpu_test
