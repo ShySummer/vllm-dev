@@ -461,96 +461,124 @@ class Scheduler(SchedulerInterface):
     def _schedule_layered_prefill(
         self, throttle_prefills: bool = False
     ) -> SchedulerOutput:
-        """Schedule Decode first, then one fixed-budget layer group."""
-        candidate = self._get_layered_prefill_candidate()
-        if candidate is None:
+        """Schedule Decode first, then compatible layer groups within MBT."""
+        candidates = self._get_layered_prefill_candidates()
+        if not candidates:
             return self._schedule_regular(throttle_prefills)
 
-        if self._pause_state != PauseState.UNPAUSED:
-            self._reset_or_preempt_layered_request(candidate)
-            return self._schedule_regular(throttle_prefills)
-
-        if not self._layered_prefill_supported_for_scheduler():
-            # Fail closed: an unsupported configuration must not leave a
-            # request marked layered while the regular scheduler skips it.
-            self._reset_or_preempt_layered_request(candidate)
-            return self._schedule_regular(throttle_prefills)
-
-        query_tokens = candidate.layered_prefill_query_tokens
-        if query_tokens <= 0 or query_tokens > self.max_num_scheduled_tokens:
-            logger.warning_once(
-                "Layered prefill request %s exceeds the token budget; "
-                "falling back to regular scheduling.",
-                candidate.request_id,
-            )
-            self._reset_or_preempt_layered_request(candidate)
-            return self._schedule_regular(throttle_prefills)
-
-        # Layered prefill is intended to hide P work behind Decode.  Starting
-        # a fresh cohort with no Decode work would only add scheduler steps to
-        # TTFT, so let the ordinary full-prefill path handle that case.  Once
-        # a cohort has committed prompt tokens, later chunks must finish from
-        # their saved position even if Decode drains in the meantime.
         if (
-            self.layered_prefill_policy.config.require_pd_mixed
-            and candidate.layered_prefill_group_id == 0
-            and candidate.num_computed_tokens == 0
-            and not self._has_layered_decode_work(candidate)
+            self._pause_state != PauseState.UNPAUSED
+            or not self._layered_prefill_supported_for_scheduler()
         ):
-            self._reset_or_preempt_layered_request(candidate)
+            for candidate in candidates:
+                self._reset_or_preempt_layered_request(candidate)
             return self._schedule_regular(throttle_prefills)
 
-        admission_status = candidate.status
-        request_needs_admission = admission_status in (
-            RequestStatus.WAITING,
-            RequestStatus.PREEMPTED,
-        )
-        request_is_new = admission_status == RequestStatus.WAITING
-        if request_needs_admission:
-            self._remove_layered_candidate_from_waiting(candidate)
+        eligible = []
+        for candidate in candidates:
+            query_tokens = candidate.layered_prefill_query_tokens
+            if query_tokens <= 0 or query_tokens > self.max_num_scheduled_tokens:
+                logger.warning_once(
+                    "Layered prefill request %s exceeds the token budget; "
+                    "falling back to regular scheduling.",
+                    candidate.request_id,
+                )
+                self._reset_or_preempt_layered_request(candidate)
+            elif (
+                self.layered_prefill_policy.config.require_pd_mixed
+                and candidate.layered_prefill_group_id == 0
+                and candidate.num_computed_tokens == 0
+                and not self._has_layered_decode_work(candidate)
+            ):
+                self._reset_or_preempt_layered_request(candidate)
+            else:
+                eligible.append(candidate)
 
+        if not eligible:
+            return self._schedule_regular(throttle_prefills)
         self._hold_layered_prefills = True
         try:
             scheduler_output = self._schedule_regular(throttle_prefills)
         finally:
             self._hold_layered_prefills = False
 
-        if not candidate.layered_prefill_enabled or (
-            candidate.status not in (
+        for candidate in eligible:
+            if not candidate.layered_prefill_enabled or candidate.status not in (
                 RequestStatus.WAITING,
                 RequestStatus.PREEMPTED,
                 RequestStatus.RUNNING,
-            )
-        ):
-            if request_needs_admission:
-                self._requeue_layered_candidate(candidate, admission_status)
-            return scheduler_output
+            ):
+                continue
+            self._append_layered_candidate(candidate, scheduler_output)
+        return scheduler_output
 
+    def _append_layered_candidate(
+        self, candidate: Request, scheduler_output: SchedulerOutput
+    ) -> None:
+        admission_status = candidate.status
+        request_needs_admission = admission_status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        )
+        request_is_new = admission_status == RequestStatus.WAITING
+        num_computed_tokens = candidate.num_computed_tokens
+        original_chunk = (
+            candidate.layered_prefill_group_id,
+            candidate.layered_prefill_num_groups,
+            candidate.layered_prefill_query_tokens,
+        )
+        new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+        if request_needs_admission and num_computed_tokens == 0:
+            (
+                new_computed_blocks,
+                num_computed_tokens,
+                candidate.shared_prefix_boundary,
+            ) = self.kv_cache_manager.get_computed_blocks(candidate)
+            if num_computed_tokens != candidate.num_computed_tokens:
+                self.layered_prefill_policy.plan_chunk(candidate, num_computed_tokens)
+
+        query_tokens = candidate.layered_prefill_query_tokens
         remaining_tokens = (
             self.max_num_scheduled_tokens
             - scheduler_output.total_num_scheduled_tokens
         )
-        if query_tokens > remaining_tokens:
-            if request_needs_admission:
-                self._requeue_layered_candidate(candidate, admission_status)
-            return scheduler_output
+        if query_tokens <= 0 or query_tokens > remaining_tokens:
+            (
+                candidate.layered_prefill_group_id,
+                candidate.layered_prefill_num_groups,
+                candidate.layered_prefill_query_tokens,
+            ) = original_chunk
+            return
 
-        # Admit P after Decode.  Later groups reuse the prompt reservation.
+        current_plan = scheduler_output.layered_prefill_plan
+        if current_plan is not None and (
+            candidate.layered_prefill_group_id != current_plan.group_id
+            or candidate.layered_prefill_num_groups != current_plan.num_groups
+            or (num_computed_tokens + query_tokens >= candidate.num_prompt_tokens)
+            != current_plan.is_final_chunk
+            or (
+                candidate.layered_prefill_kv_reserved
+                and candidate.layered_prefill_group_id > 0
+            ) != current_plan.reuse_kv_blocks
+        ):
+            (
+                candidate.layered_prefill_group_id,
+                candidate.layered_prefill_num_groups,
+                candidate.layered_prefill_query_tokens,
+            ) = original_chunk
+            return
+
         if request_needs_admission:
             if len(self.running) >= self.max_num_running_reqs:
-                self._requeue_layered_candidate(candidate, admission_status)
-                return scheduler_output
-            # Prefix-cache lookup mirrors the regular waiting path.  Cached
-            # blocks are complete for every layer once the producing request
-            # finished its cohort, so layered requests may reuse them.
-            num_computed_tokens = candidate.num_computed_tokens
-            new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
-            if num_computed_tokens == 0:
                 (
-                    new_computed_blocks,
-                    num_computed_tokens,
-                    candidate.shared_prefix_boundary,
-                ) = self.kv_cache_manager.get_computed_blocks(candidate)
+                    candidate.layered_prefill_group_id,
+                    candidate.layered_prefill_num_groups,
+                    candidate.layered_prefill_query_tokens,
+                ) = original_chunk
+                return
+            self._remove_layered_candidate_from_waiting(candidate)
+        # Admit P after Decode.  Later groups reuse the prompt reservation.
+        if request_needs_admission:
             new_blocks = self.kv_cache_manager.allocate_slots(
                 candidate,
                 candidate.num_prompt_tokens - num_computed_tokens,
@@ -564,15 +592,8 @@ class Scheduler(SchedulerInterface):
                 if candidate.layered_prefill_group_id == 0:
                     reset_layered_prefill_request(candidate)
                 self._requeue_layered_candidate(candidate, admission_status)
-                return scheduler_output
-            if num_computed_tokens != candidate.num_computed_tokens:
-                candidate.num_computed_tokens = num_computed_tokens
-                # Re-plan the first chunk from the cache-hit position so
-                # only uncached tokens consume query budget.
-                self.layered_prefill_policy.plan_chunk(
-                    candidate, num_computed_tokens
-                )
-                query_tokens = candidate.layered_prefill_query_tokens
+                return None
+            candidate.num_computed_tokens = num_computed_tokens
             candidate.status = RequestStatus.RUNNING
             self.running.append(candidate)
             self._inflight_prefills.add(candidate)
@@ -648,6 +669,14 @@ class Scheduler(SchedulerInterface):
             ] = candidate.num_computed_tokens
 
         plan = self.layered_prefill_policy.make_plan(candidate)
+        current_plan = scheduler_output.layered_prefill_plan
+        if current_plan is not None:
+            plan = replace(
+                current_plan,
+                prefill_req_ids=current_plan.prefill_req_ids + (req_id,),
+                query_tokens={**current_plan.query_tokens, **plan.query_tokens},
+                commit_tokens={**current_plan.commit_tokens, **plan.commit_tokens},
+            )
         scheduler_output.layered_prefill_plan = plan
         candidate.layered_prefill_kv_reserved = True
         if _LAYERED_PREFILL_TRACE:
@@ -666,7 +695,6 @@ class Scheduler(SchedulerInterface):
             )
         self._update_after_layered_schedule(candidate, scheduler_output)
         self.prev_step_scheduled_req_ids.add(req_id)
-        return scheduler_output
 
     def _remove_layered_candidate_from_waiting(self, request: Request) -> None:
         for queue in (self.waiting, self.skipped_waiting):
@@ -715,13 +743,14 @@ class Scheduler(SchedulerInterface):
         else:
             reset_layered_prefill_request(request)
 
-    def _get_layered_prefill_candidate(self) -> Request | None:
+    def _get_layered_prefill_candidates(self) -> list[Request]:
+        candidates: list[Request] = []
         for request in self.running:
             if (
                 self._is_layered_prefill_pending(request)
                 and self._is_layered_request_eligible(request)
             ):
-                return request
+                candidates.append(request)
         # Decode requests and unsupported request types can be ahead of a
         # prompt in either FCFS or priority queues.  Walk the queue rather
         # than looking only at its head so a Decode row can share the step
@@ -733,8 +762,8 @@ class Scheduler(SchedulerInterface):
                 if not request.layered_prefill_enabled:
                     self.layered_prefill_policy.initialize_request(request)
                 if self._is_layered_prefill_pending(request):
-                    return request
-        return None
+                    candidates.append(request)
+        return candidates
 
     def _should_hold_for_layered_prefill(self, request: Request) -> bool:
         """Whether regular scheduling must leave a prompt for the policy."""

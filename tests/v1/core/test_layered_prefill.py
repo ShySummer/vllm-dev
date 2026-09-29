@@ -542,14 +542,15 @@ def test_layered_admission_failure_does_not_starve_decode():
         num_requests=2, num_tokens=520, max_tokens=8, ignore_eos=True
     )
     scheduler.add_request(first)
-    scheduler.add_request(blocked)
 
-    # The first request runs through its two layer groups and samples.
+    # Finish the first cohort before admitting the request whose KV
+    # reservation will fail; compatible cohorts can now share a step.
     for _ in range(2):
         sched_output = scheduler.schedule()
         assert sched_output.total_num_scheduled_tokens > 0
         assert scheduler._layered_stall_steps == 0
         _run_async_step(scheduler, sched_output)
+    scheduler.add_request(blocked)
 
     # `first` is now a decode request. Fail every full-prompt reservation
     # (the pool cannot fit a second request) while small decode allocations
@@ -615,3 +616,86 @@ def test_layered_stall_watchdog_preempts_unschedulable_running_request():
     sched_output = scheduler.schedule()
     assert sched_output.total_num_scheduled_tokens > 0
     assert wedged.status == RequestStatus.RUNNING
+
+@pytest.mark.cpu_test
+def test_layered_prefill_batches_compatible_requests_after_decode():
+    scheduler = create_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=1100,
+        max_model_len=2048,
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+    )
+    (decode,) = create_requests(
+        num_requests=1, num_tokens=32, max_tokens=10, ignore_eos=True
+    )
+    scheduler.add_request(decode)
+    _run_async_step(scheduler, scheduler.schedule())
+
+    first, second = create_requests(
+        num_requests=2, num_tokens=513, max_tokens=2, ignore_eos=True
+    )
+    first.request_id = "prefill-first"
+    second.request_id = "prefill-second"
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+
+    output = scheduler.schedule()
+    plan = output.layered_prefill_plan
+    assert plan is not None
+    assert plan.prefill_req_ids == (first.request_id, second.request_id)
+    assert plan.query_tokens == {first.request_id: 513, second.request_id: 513}
+    assert output.num_scheduled_tokens[decode.request_id] == 1
+    assert output.total_num_scheduled_tokens == 1027
+    assert plan.commit_tokens == {first.request_id: 0, second.request_id: 0}
+    _run_async_step(scheduler, output)
+
+    output = scheduler.schedule()
+    plan = output.layered_prefill_plan
+    assert plan is not None and plan.is_sampling_step
+    assert plan.prefill_req_ids == (first.request_id, second.request_id)
+    assert plan.commit_tokens == plan.query_tokens
+    _run_async_step(scheduler, output)
+    assert first.num_output_placeholders == 0
+    assert second.num_output_placeholders == 0
+
+
+@pytest.mark.cpu_test
+def test_layered_prefill_skips_chunk_that_does_not_fit_remaining_mbt():
+    scheduler = create_scheduler(
+        max_num_seqs=5,
+        max_num_batched_tokens=1100,
+        max_model_len=2048,
+        async_scheduling=True,
+        additional_config=_LAYERED_ASYNC_ADDITIONAL_CONFIG,
+        cudagraph_mode="NONE",
+        enforce_eager=True,
+    )
+    (decode,) = create_requests(
+        num_requests=1, num_tokens=32, max_tokens=10, ignore_eos=True
+    )
+    scheduler.add_request(decode)
+    _run_async_step(scheduler, scheduler.schedule())
+
+    first, later = create_requests(
+        num_requests=2, num_tokens=513, max_tokens=2, ignore_eos=True
+    )
+    (too_large,) = create_requests(
+        num_requests=1, num_tokens=700, max_tokens=2, ignore_eos=True
+    )
+    first.request_id = "prefill-first"
+    too_large.request_id = "prefill-too-large"
+    later.request_id = "prefill-later"
+    scheduler.add_request(first)
+    scheduler.add_request(too_large)
+    scheduler.add_request(later)
+
+    output = scheduler.schedule()
+    plan = output.layered_prefill_plan
+    assert plan is not None
+    assert plan.prefill_req_ids == (first.request_id, later.request_id)
+    assert too_large.request_id not in output.num_scheduled_tokens
+    assert too_large.status == RequestStatus.WAITING
+    assert output.total_num_scheduled_tokens <= scheduler.max_num_scheduled_tokens
